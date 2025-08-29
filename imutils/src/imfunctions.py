@@ -10,6 +10,10 @@ from natsort import natsorted
 from imutils import MicroscopeDataReader
 import dask.array as da
 from skimage.morphology import binary_erosion
+from scipy.ndimage import label, sum as ndi_sum, center_of_mass
+from scipy.ndimage import gaussian_filter
+import warnings
+import traceback
 
 
 def tiff2avi(tiff_path, avi_path, fourcc, fps):
@@ -105,25 +109,38 @@ def ometiff2bigtiff(path, output_filename=None):
     if not defined it will be generated based on the path name.
     """
     print(path)
-    # find number of files in path that end with "ome.tif"
-    num_files = len([name for name in os.listdir(path) if name.endswith("ome.tif")])
-    if num_files == 0:
-        print("Aborted because no ome.tiff files found in path, therefore no bigtiff was created.")
+    # Create 'output' folder if it doesn't exist
+    output_folder = os.path.join(path, "output")
+    os.makedirs(output_folder, exist_ok=True)
+    
+    # find number of files in path that end with "NDTiffStack.tif"
+    tiff_files = [name for name in os.listdir(path) if name.endswith(".tif")]
+    # Sort files (assuming the suffixes are numerical like _1, _2, etc., so they are sorted correctly)
+    tiff_files = natsorted(tiff_files)
+    print(f"Found TIFF files: {tiff_files}")
+
+    if len(tiff_files) == 0:
+        print("Aborted because no nd.tiff files found in path, therefore no bigtiff was created.")
         return
     if output_filename is None:
         if path.endswith('/'):
-            output_filename = path + re.split('/', path)[-2] + 'bigtiff.btf'
+            output_filename = os.path.join(output_folder, 'raw_stack.btf')
         else:
-            output_filename = path + '/' + re.split('/', path)[-1] + 'bigtiff.btf'
+            output_filename = os.path.join(output_folder, 'raw_stack.btf')
+    #else:
+        # Ensure the custom output file is in the output folder
+     #   output_filename = os.path.join(output_folder, os.path.basename(output_filename))
+
+    print(f"Output file will be saved to: {output_filename}")
 
     with tiff.TiffWriter(output_filename, bigtiff=True) as output_tif:
         # print(f'list of files is {os.listdir(path)}')
-        for file in natsorted(os.listdir(path)):
+        for file in tiff_files:
             # print(os.path.join(path, file))
-            if file.endswith('ome.tif'):
+            # if file.endswith('.tif'):
                 # print(os.path.join(path, file))
                 with tiff.TiffFile(os.path.join(path, file)) as tif:
-                    print('length of pages is: ', len(tif.pages))
+                    # print('length of pages is: ', len(tif.pages))
                     # print('length of series is: ', len(tif.series))
                     for idx, page in enumerate(tif.pages):
                         # print(idx)
@@ -266,6 +283,7 @@ def stack_subtract_background(input_filepath, output_filepath, background_img_fi
     # load background image
     reader_obj_background = MicroscopeDataReader(background_img_filepath, as_raw_tiff=True, raw_tiff_is_2d=True)
     bg_img = np.array(da.squeeze(reader_obj_background.dask_array))
+    assert bg_img.dtype == np.uint8
     try:
         # Try to read the input file as a .btf
         reader_obj_video = MicroscopeDataReader(input_filepath, as_raw_tiff=True, raw_tiff_num_slices=1)
@@ -274,24 +292,36 @@ def stack_subtract_background(input_filepath, output_filepath, background_img_fi
         reader_obj_video = MicroscopeDataReader(input_filepath, as_raw_tiff=False)
 
     tif = da.squeeze(reader_obj_video.dask_array)
+    assert tif.dtype == np.uint8
 
     if invert:
         bg_img = cv2.bitwise_not(bg_img) # .astype(dtype=np.uint8)
         print("inverting background image")
     else:
         print("using background as it is")
-
+    mean_bg = 2*(np.max(bg_img)-np.min(bg_img))
+    bg_img = bg_img.astype(np.float64)
+    print(mean_bg)
     with tiff.TiffWriter(output_filepath, bigtiff=True) as tif_writer:
         for i, img in enumerate(tif):
             img = np.array(img)
             if invert:
                 img = cv2.bitwise_not(img)
+            img = img.astype(np.float64)
+            #print(np.mean(img))
             new_img = cv2.subtract(img, bg_img)
+            #print(f'max: {np.max(new_img)}, min: {np.min(new_img)}')
+            new_img += mean_bg
+            #print(f'max+: {np.max(new_img)}, min+: {np.min(new_img)}')
+            #print(f'dtype after addition: {new_img.dtype}')
+            new_img = new_img.astype(np.uint8)
+            #print(new_img.dtype)
             tif_writer.write(new_img, photometric='minisblack',  contiguous=True)
+            
 
 
 def stack_make_binary(stack_input_filepath: str, stack_output_filepath: str, threshold: float,
-                      max_value: float):
+                      max_value: float = 65535.0, min_component_size: int = 3):
     """
     write a binary stack based on lower and higher threshold
     Parameters:
@@ -304,17 +334,73 @@ def stack_make_binary(stack_input_filepath: str, stack_output_filepath: str, thr
     -------------
     None
     """
-    reader_obj = MicroscopeDataReader(stack_input_filepath, as_raw_tiff=True, raw_tiff_num_slices=1)
-    tif = da.squeeze(reader_obj.dask_array)
+    print(f"--- Starting Binary Filtering (Output: uint16) ---")
+    print(f"Input: {stack_input_filepath}, Output: {stack_output_filepath}")
+    print(f"Threshold: {threshold}, Max Value: {max_value}, Min Component Size > {min_component_size}")
+    
+    output_dtype = np.uint16
+    max_uint16 = np.iinfo(output_dtype).max # 65535
+
+    # --- Validate and Prepare max_value ---
+    try:
+        max_value_int = int(round(max_value))
+        # Clamp to valid uint16 range
+        max_value_int = max(0, min(max_value_int, max_uint16))
+        max_value_out = output_dtype(max_value_int)
+    except (ValueError, TypeError):
+        print(f"Warning: Invalid max_value ({max_value}). Using {max_uint16}.")
+        max_value_out = output_dtype(max_uint16)
+    print(f"Using output 'on' value: {max_value_out}")
+
+    # --- Load Input Data ---
+    try:
+        # Use MicroscopeDataReader or replace with tifffile.imread or TiffFile
+        reader_obj = MicroscopeDataReader(stack_input_filepath, as_raw_tiff=True, raw_tiff_num_slices=1)
+        tif = da.squeeze(reader_obj.dask_array)
+        print(f"Input shape (Dask): {tif.shape}, dtype: {tif.dtype}")
+    except NameError:
+        print("Warning: MicroscopeDataReader not found. Using tifffile.")
+        return
+
+    # --- Process Frames and Write Output ---
     with tiff.TiffWriter(stack_output_filepath, bigtiff=True) as tif_writer:
-        for i, img in enumerate(tif):
-            img = np.array(img)
-            # apply threshold
-            ret, new_img = cv2.threshold(img, threshold, max_value, cv2.THRESH_BINARY)
-            #convert matrix to np.uint
-            #new_img = new_img * 255
-            new_img = new_img.astype(np.uint8)
-            tif_writer.write(new_img, contiguous=True)
+        # Iterate through each frame
+        for i, img_frame in enumerate(tif):
+            # Ensure frame is a NumPy array (computes if using Dask)
+            img = np.array(img_frame)
+
+            # 1. Apply Intensity Threshold
+            # Result is float64, needs conversion later
+            ret, initial_binary_img_float = cv2.threshold(img, threshold, float(max_value_out), cv2.THRESH_BINARY)
+
+            # 2. Create Boolean Mask (directly from float is fine)
+            initial_mask = initial_binary_img_float > 0
+
+            # 3. Label Connected Components
+            labeled_mask, num_features = label(initial_mask, structure=np.ones((3,3)))
+
+            # Initialize final frame as zeros with the correct uint16 type
+            final_frame = np.zeros_like(img, dtype=output_dtype)
+
+            # 4. Filter Components by Size
+            if num_features > 0:
+                component_sizes = ndi_sum(initial_mask, labels=labeled_mask, index=np.arange(1, num_features + 1))
+                # Note: min_component_size is now correctly defined as a function parameter
+                large_enough_labels = [label_index for label_index, size in enumerate(component_sizes, start=1)
+                                       if size > min_component_size]
+
+                if large_enough_labels:
+                    # Create mask of only large components
+                    size_filtered_mask = np.isin(labeled_mask, large_enough_labels)
+                    # Generate final frame using the correct output type
+                    final_frame = np.where(size_filtered_mask, max_value_out, output_dtype(0))
+            # If no features or no large features, final_frame remains zeros
+
+            # 5. Write the Processed Frame (as uint16)
+            tif_writer.write(final_frame.astype(output_dtype), contiguous=True, photometric='minisblack')
+
+    print(f"--- Finished writing filtered binary stack ({output_dtype}) to {stack_output_filepath} ---")
+   
 
 def stack_normalise(stack_input_filepath: str, stack_output_filepath: str, alpha: float,
                       beta: float):
@@ -1058,6 +1144,875 @@ def distance_to_image_center(image_shape, point):
     result = np.asarray(point) - center
     return result
 
+
+#FUNCTIONS ADDED BY LAXMI FOR ZIM06 FLUORESCENCE PIPELINE and can be called from imutils parser.
+#FUNCTIONS ADDED BY LAXMI FOR ZIM06 FLUORESCENCE PIPELINE
+
+
+def calculate_roi_bounds(centroid, roi_half_size, img_shape):
+    """
+    Calculates ROI boundaries based on centroid and half-size,
+    clamping the coordinates to stay within image dimensions.
+    Ensures the ROI has a minimum size of 1x1.
+    Includes basic check for valid centroid input.
+    """
+    height, width = img_shape
+    # Ensure centroid components are valid numbers before proceeding
+    if centroid is None or not all(np.isfinite(c) for c in centroid):
+        # Raise error here as it's a logic issue if centroid is invalid
+        raise ValueError(f"Invalid centroid coordinates for ROI calculation: {centroid}")
+    
+    cy, cx = centroid # Expects (row, col) format from center_of_mass
+    cy_int, cx_int = int(round(cy)), int(round(cx))
+
+    # Calculate initial bounds
+    y_start = max(0, cy_int - roi_half_size)
+    y_end = min(height, cy_int + roi_half_size + 1) # +1 for exclusive upper bound
+    x_start = max(0, cx_int - roi_half_size)
+    x_end = min(width, cx_int + roi_half_size + 1) # +1 for exclusive upper bound
+
+    # Ensure minimum size of 1 pixel if bounds collapsed
+    if y_start == y_end:
+        if y_end < height: y_end += 1
+        elif y_start > 0: y_start -= 1
+    if x_start == x_end:
+        if x_end < width: x_end += 1
+        elif x_start > 0: x_start -= 1
+
+    # Final clamp
+    y_start = max(0, y_start)
+    y_end = min(height, y_end)
+    x_start = max(0, x_start)
+    x_end = min(width, x_end)
+
+    # Check for zero size ROI after all adjustments
+    if y_start >= y_end or x_start >= x_end:
+         warnings.warn(f"Resulting ROI may have zero size ({y_start}:{y_end}, {x_start}:{x_end}) for centroid {centroid}. Adjusting to min 1x1.")
+         y_end = max(y_end, y_start + 1)
+         x_end = max(x_end, x_start + 1)
+         y_end = min(height, y_end)
+         x_end = min(width, x_end)
+         if y_start >= y_end or x_start >= x_end:
+              raise ValueError(f"Unable to create valid 1x1 ROI bounds for centroid {centroid}")
+
+    return y_start, y_end, x_start, x_end
+
+def process_frame_globally(img, threshold, max_value_out, min_component_size, output_dtype, roi_half_size):
+    """
+    Processes a single frame globally: thresholds, finds connected components,
+    filters by size, and calculates centroid and ROI for the largest components.
+    Returns the resulting mask, centroid, ROI bounds, and a success flag.
+    Includes basic error handling for centroid/ROI calculation.
+    """
+    if img is None or img.size == 0:
+        warnings.warn("process_frame_globally received empty image.")
+        return np.array([], dtype=bool), None, None, False
+
+    img_shape = img.shape
+    current_mask = np.zeros(img_shape, dtype=bool) # Default to empty
+    current_centroid = None
+    current_roi_bounds = None
+    found_components = False
+    
+    # 1. Thresholding
+    ret, initial_binary_img_float = cv2.threshold(img, threshold, float(max_value_out), cv2.THRESH_BINARY)
+    initial_mask = initial_binary_img_float > 0
+    # 2. Labeling
+    labeled_mask, num_features = label(initial_mask, structure=np.ones((3, 3)))
+    # 3. Size Filtering
+    if num_features > 0:
+        component_sizes = ndi_sum(initial_mask, labels=labeled_mask, index=np.arange(1, num_features + 1))
+        large_enough_indices = np.where(component_sizes > min_component_size)[0]
+        if large_enough_indices.size > 0:
+            large_enough_labels = large_enough_indices + 1
+            current_mask = np.isin(labeled_mask, large_enough_labels)
+            if np.any(current_mask): found_components = True
+            else: 
+                current_mask = np.zeros(img_shape, dtype=bool)
+
+    # 4. Centroid and ROI Calculation (only if components were found and kept)
+    if found_components:
+        try:
+            current_centroid = center_of_mass(current_mask)
+            current_roi_bounds = calculate_roi_bounds(current_centroid, roi_half_size, img_shape)
+        except Exception as e:
+             warnings.warn(f"Global search: Centroid/ROI calculation failed: {e}. Treating as no components found.")
+             current_mask = np.zeros(img_shape, dtype=bool)
+             current_centroid, current_roi_bounds = None, None
+             found_components = False
+
+    return current_mask, current_centroid, current_roi_bounds, found_components
+
+def stack_make_binary_tracked(stack_input_filepath: str, stack_output_filepath: str, threshold: float,
+                        max_value: float = 255.0, min_component_size: int = 3, roi_half_size: int = 10):
+    """
+    Writes a binary stack (uint8) using a tracked ROI.
+    Attempts global search until tracking is initialized.
+    Calculates and prints min/max mask pixel counts and frames without masks at the end.
+    """
+    print(f"--- Starting Tracked Binary Filtering (Output: uint8) ---")
+    print(f"Input: {stack_input_filepath}, Output: {stack_output_filepath}")
+    print(f"Threshold: {threshold}, Max Value: {max_value}, Min Component Size > {min_component_size}, ROI half size: {roi_half_size}")
+
+    output_dtype = np.uint8
+    # Calculate output value, clamped to uint8 range
+    max_value_out = output_dtype(min(np.iinfo(output_dtype).max, max(0, round(max_value))))
+    print(f"Using output 'on' value: {max_value_out}")
+    
+    reader_obj = MicroscopeDataReader(stack_input_filepath, as_raw_tiff=True, raw_tiff_num_slices=1)
+    tif_stack = da.squeeze(reader_obj.dask_array)
+    # --- Determine Image Shape from Dask Array ---
+    try:
+        if len(tif_stack.shape) >= 2:
+            img_shape = tif_stack.shape[-2:] # Assume YX are the last two dimensions
+        else:
+            raise ValueError(f"Dask array has unexpected shape: {tif_stack.shape}")
+        print(f"Determined Image Shape (YX): {img_shape}")
+    except Exception as e:
+        print(f"ERROR: Could not determine image shape from Dask array: {e}")
+        return # Exit if shape cannot be determined
+    
+    # --- Initialize Tracking State ---
+    # These store the state of the LAST SUCCESSFUL frame
+    last_successful_mask = None
+    last_successful_centroid = None
+    last_successful_roi_bounds = None
+    
+    # --- Initialize Min/Max Pixel Count Tracking ---
+    min_mask_pixels = float('inf')
+    max_mask_pixels = 0
+    masks_found_count = 0 # To check if any masks were found at all
+    frames_without_mask = [] # <-- Initialize list to store frames without masks
+    # --- NEW LOGIC FOR CONSECUTIVE EMPTY FRAMES START ---
+    consecutive_empty_frames = 0
+    CONSECUTIVE_EMPTY_THRESHOLD = 5 
+    # --- NEW LOGIC FOR CONSECUTIVE EMPTY FRAMES END ---
+    num_frames_processed = 0
+
+    # --- Process Frames and Write Output ---
+    try:
+        with tiff.TiffWriter(stack_output_filepath, bigtiff=True) as tif_writer:
+            # Iterating over a Dask array triggers computation chunk by chunk (or frame by frame if chunked that way)
+            for i, img_frame in enumerate(tif_stack):
+                num_frames_processed += 1
+                # img_frame is now computed (a NumPy array)
+                img = np.array(img_frame)
+                if img.shape[-2:] != img_shape:
+                     warnings.warn(f"Frame {i} shape {img.shape[-2:]} differs from expected {img_shape}. Writing empty frame.")
+                     tif_writer.write(np.zeros(img_shape, dtype=output_dtype), contiguous=True, photometric='minisblack')
+                     frames_without_mask.append(i) # <-- Add frame index if shape mismatch
+                     consecutive_empty_frames += 1 
+                     continue
+
+                current_mask = np.zeros(img_shape, dtype=bool)
+                final_frame = np.zeros(img_shape, dtype=output_dtype)
+                found_in_frame = False
+                
+                # --- NEW LOGIC FOR CONSECUTIVE EMPTY FRAMES START ---
+                if consecutive_empty_frames >= CONSECUTIVE_EMPTY_THRESHOLD:
+                    warnings.warn(f"Frame {i}: {consecutive_empty_frames} consecutive empty frames. Forcing global search and resetting tracking state.")
+                    last_successful_roi_bounds = None 
+                    last_successful_centroid = None
+                    last_successful_mask = None # Ensure all tracking state is reset
+                    consecutive_empty_frames = 0 # Reset counter after forcing
+                # --- NEW LOGIC FOR CONSECUTIVE EMPTY FRAMES END ---
+
+                if last_successful_roi_bounds is None:
+                    # --- Tracking NOT Initialized: Attempt Global Search ---
+                    if i == 0: print(f"Frame 0: Attempting initial global search...")
+                    else: warnings.warn(f"Frame {i}: Tracking not initialized. Attempting global search...")
+
+                    mask_found, centroid, roi_bounds, found = process_frame_globally(
+                        img, threshold, max_value_out, min_component_size, output_dtype, roi_half_size
+                    )
+                    if found:
+                         print(f"Frame {i}: Global search SUCCEEDED. Initializing tracking.")
+                         current_mask = mask_found
+                         last_successful_mask = current_mask
+                         last_successful_centroid = centroid
+                         last_successful_roi_bounds = roi_bounds
+                         found_in_frame = True
+                    # else: Global search failed, warning printed in helper
+
+                else:
+                    # --- Tracking IS Initialized: Attempt ROI-based Tracking ---
+                    y_s, y_e, x_s, x_e = last_successful_roi_bounds
+                    if not (y_s < y_e and x_s < x_e):
+                         warnings.warn(f"Frame {i}: Invalid previous ROI bounds {last_successful_roi_bounds}. Saving empty frame. Reusing previous ROI.")
+                    else:
+                        img_roi_only = np.zeros_like(img)
+                        img_roi_only[y_s:y_e, x_s:x_e] = img[y_s:y_e, x_s:x_e]
+                        ret, roi_binary = cv2.threshold(img_roi_only, threshold, float(max_value_out), cv2.THRESH_BINARY)
+                        roi_initial_mask = roi_binary > 0
+                        labeled_roi, num_features = label(roi_initial_mask, structure=np.ones((3, 3)))
+
+                        mask_in_roi = np.zeros_like(img, dtype=bool)
+                        found_in_roi = False
+                        if num_features > 0:
+                            sizes = ndi_sum(roi_initial_mask, labels=labeled_roi, index=np.arange(1, num_features + 1))
+                            indices = np.where(sizes > min_component_size)[0]
+                            if indices.size > 0:
+                                labels = indices + 1
+                                mask_in_roi = np.isin(labeled_roi, labels)
+                                if np.any(mask_in_roi): found_in_roi = True
+
+                        if found_in_roi:
+                             try: # Keep try-except for math/logic errors here
+                                centroid = center_of_mass(mask_in_roi)
+                                roi_bounds = calculate_roi_bounds(centroid, roi_half_size, img_shape)
+                                current_mask = mask_in_roi
+                                last_successful_mask = current_mask
+                                last_successful_centroid = centroid
+                                last_successful_roi_bounds = roi_bounds
+                                found_in_frame = True
+                             except Exception as e:
+                                 warnings.warn(f"Frame {i}: ROI centroid/bounds calculation failed: {e}. Saving empty frame. Reusing previous ROI.")
+                        # else: # Tracking failed within ROI, warning printed in helper
+                        
+                # --- Update Min/Max Pixel Counts & Record Frames Without Mask ---
+                if found_in_frame:
+                     num_pixels = np.sum(current_mask) # Count True values in boolean mask
+                     min_mask_pixels = min(min_mask_pixels, num_pixels)
+                     max_mask_pixels = max(max_mask_pixels, num_pixels)
+                     masks_found_count += 1
+                     consecutive_empty_frames = 0
+                     # print(f"Frame {i}: Mask found with {num_pixels} pixels.") # Optional debug print
+                else:
+                     # Add frame index if no mask was successfully generated in this frame
+                     frames_without_mask.append(i) # <-- Add frame index on failure
+                     consecutive_empty_frames += 1
+
+                # --- Generate & Write Final Frame ---
+                final_frame = np.zeros(img_shape, dtype=output_dtype) # Initialize clean
+                if found_in_frame:
+                     final_frame = np.where(current_mask, max_value_out, output_dtype(0))
+                tif_writer.write(final_frame.astype(output_dtype), contiguous=True, photometric='minisblack')
+
+        print(f"--- Finished writing tracked binary stack (uint8) to {stack_output_filepath} ---")
+
+    # Keep this outer try-except for errors during the main loop/writing
+    except Exception as e:
+        print(f"\n--- ERROR during processing/writing loop ---")
+        print(f"{type(e).__name__}: {e}")
+        print("Traceback:")
+        traceback.print_exc()
+        print(f"Output file '{stack_output_filepath}' may be incomplete or corrupted.")
+        # --- Print Final Statistics Even if Loop Exited Early ---
+        print("\n--- Mask Pixel Statistics (Partial results due to error) ---")
+        if masks_found_count > 0:
+            print(f"Minimum mask pixels (across {masks_found_count} frames with masks): {min_mask_pixels}")
+            print(f"Maximum mask pixels (across {masks_found_count} frames with masks): {max_mask_pixels}")
+        else:
+            print("No masks were successfully generated.")
+        # Print frames without masks (even if partial)
+        if frames_without_mask:
+            print(f"Frames where no mask was generated: {frames_without_mask}")
+        else:
+             if masks_found_count > 0: # Only print if some masks *were* found
+                  print("Mask generated successfully for all processed frames.")
+        return # Exit after reporting partial stats if error occurred
+
+    # --- Print Final Statistics (if loop completed successfully) ---
+    print("\n--- Mask Pixel Statistics ---")
+    if masks_found_count > 0:
+        print(f"Minimum mask pixels (across {masks_found_count} frames with masks): {min_mask_pixels}")
+        print(f"Maximum mask pixels (across {masks_found_count} frames with masks): {max_mask_pixels}")
+    else:
+        print("No masks were successfully generated in any frame.")
+
+    # Print frames without masks
+    if frames_without_mask:
+        print(f"Frames where no mask was generated: {frames_without_mask}")
+    else:
+        if masks_found_count > 0: # Check if *any* processing happened
+             print("Mask generated successfully for all processed frames.")
+
+def calculate_measurements(input_img_path, background_img_path, output_csv_path, threshold, top_n):
+    """
+    Reads a main image stack and a background stack, calculates various
+    intensity and pixel count metrics per frame, and saves them to a CSV file.
+    Top N calculations are only performed if the frame has more pixels than top_n.
+    Background intensity at top_n locations is calculated if
+    the main image and background image frames have matching dimensions.
+    Args:
+        input_img_path (str): Path to the main input TIFF stack (masked image).
+        background_img_path (str): Path to the background TIFF stack.
+        output_csv_path (str): Path where the output CSV file will be saved.
+        threshold (float): Intensity threshold for counting pixels in the main image.
+        top_n (int): The number of top intensity pixels to consider for metrics.
+    Returns:
+        None: Writes the results directly to the output CSV file.
+    """
+    
+    frame_number_list = []
+    n_values_list = []                   # Count of pixels above threshold in main image
+    total_intensity_list = []            # Sum of all pixel intensities in main image frame
+    top_total_intensity_list = []        # Sum of top_n brightest pixel intensities in main image frame
+    background_total_intensity_list = [] # Sum of all pixel intensities in background image frame
+    top_background_intensity_list = []   # Sum of background pixel intensities at main image's top_n locations
+    
+    background_stack = tiff.imread(background_img_path)
+    print(f"Background stack loaded with shape: {background_stack.shape}")
+    # Basic check for unexpected dimensions (can be refined based on expected inputs)
+    if len(background_stack.shape) < 2:
+        print(f"ERROR: Background image has unexpected dimensions: {background_stack.shape}")
+        sys.exit(1)
+    elif len(background_stack.shape) == 2:
+        warnings.warn("Background image appears to be 2D. Assuming it applies to all frames.")
+        
+        # --- Process Main Image Stack Frame by Frame ---
+    frame_count = 0
+    try:
+        with tiff.TiffFile(input_img_path) as tif:
+            num_main_frames = len(tif.pages)
+            print(f"Processing {num_main_frames} frames from main image...")
+
+            # --- Sanity Check: Compare Frame Counts (if background is a stack) ---
+            process_frames = num_main_frames
+            if len(background_stack.shape) >= 3: # Only check if background is a stack
+                if num_main_frames != len(background_stack):
+                    warnings.warn(f"Warning: Main image ({num_main_frames} frames) and background image ({len(background_stack)} frames) have different lengths!")
+                    process_frames = min(num_main_frames, len(background_stack))
+                    print(f"Processing only the first {process_frames} frames due to length mismatch.")
+            elif len(background_stack.shape) == 2 and num_main_frames > 1:
+                 # warnings.warn("Main image is a stack, but background is 2D. Applying same background to all frames.") # Warning moved earlier
+                 pass # Allow processing
+            elif len(background_stack.shape) == 2 and num_main_frames == 1:
+                 pass # Both are single frames, proceed
+            else: # Mismatch like 2D main and 3D background
+                 print(f"ERROR: Incompatible dimensions between main image ({num_main_frames} frames) and background (shape {background_stack.shape}).")
+                 sys.exit(1)
+
+
+            for i in range(process_frames): # Iterate up to the determined frame count
+                page = tif.pages[i]
+                img = page.asarray()
+
+                # Get corresponding background frame or the single background image
+                if len(background_stack.shape) >= 3:
+                    bg_img = background_stack[i]
+                else: # Background is 2D
+                    bg_img = background_stack
+
+                # --- Calculate metrics for the current frame ---
+
+                # 1. Count of pixels above threshold in main image
+                pixels_above_threshold = img[img >= threshold]
+                count_of_pixels_above_threshold = pixels_above_threshold.size
+                n_values_list.append(count_of_pixels_above_threshold)
+
+                # 2. Total intensity of the main image frame
+                total_intensity_list.append(np.sum(img))
+
+                # Initialize top_n related metrics to NaN for the current frame
+                current_top_total_main_img = np.nan
+                current_top_background_intensity = np.nan
+
+                # 3. Top N calculations (if main image frame is not empty and has enough pixels)
+                if img.size > 0:
+                    flat_img = img.ravel() # Flatten for easier processing
+                    if flat_img.size > top_n:
+                        # Find indices of the top_n brightest pixels in the main image
+                        # np.argpartition is efficient: it puts the k-th smallest elements in their sorted
+                        # positions and all other elements are partitioned around them.
+                        # To get largest, we partition around -top_n and take elements from -top_n to end.
+                        top_n_indices_flat = np.argpartition(flat_img, -top_n)[-top_n:]
+
+                        # Sum of intensities of these top_n pixels in the main image
+                        current_top_total_main_img = np.sum(flat_img[top_n_indices_flat])
+
+                        # Sum of intensities of background pixels at the *same locations*
+                        flat_bg_img = bg_img.ravel()
+                        if flat_img.shape == flat_bg_img.shape: # Critical check for matching dimensions
+                            current_top_background_intensity = np.sum(flat_bg_img[top_n_indices_flat])
+                        else:
+                            warnings.warn(
+                                f"Frame {i}: Main image shape {img.shape} and background image shape {bg_img.shape} "
+                                f"are different. Skipping 'top_background_intensity' calculation for this frame."
+                            )
+                            # current_top_background_intensity remains NaN
+                    else:
+                        # Not enough pixels in the main image for top_n calculation
+                        print(
+                            f"Frame {i}: Skipping top_n related calculations for main image (found {flat_img.size} "
+                            f"pixels, need > {top_n}). 'top_background_intensity' also skipped."
+                        )
+                        # current_top_total_main_img and current_top_background_intensity remain NaN
+                else:
+                     # Main image frame is empty
+                     print(
+                         f"Frame {i}: Skipping top_n related calculations (main image frame is empty). "
+                         f"'top_background_intensity' also skipped."
+                     )
+                     # current_top_total_main_img and current_top_background_intensity remain NaN
+
+                top_total_intensity_list.append(current_top_total_main_img)
+                top_background_intensity_list.append(current_top_background_intensity)
+
+                # 4. Total intensity of the corresponding background image frame
+                background_total_intensity_list.append(np.sum(bg_img))
+
+                frame_number_list.append(i)
+                frame_count += 1
+
+        print(f"Finished processing {frame_count} frames.")
+
+    except FileNotFoundError:
+        print(f"ERROR: Main input image file not found: {input_img_path}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: Failed during processing of main image {input_img_path}: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+
+    # --- Create DataFrame and Calculate Derived Mean Metrics ---
+    print("Creating DataFrame...")
+    if frame_count == 0:
+        print("WARNING: No frames were processed. Output CSV will be empty or may fail.")
+        # Define columns for empty DataFrame to prevent error on save
+        df_columns = [
+            'frame', 'total_intensity', 'n_values', 'top_total_intensity',
+            'background_total_intensity', 'top_background_intensity',
+            'mean_intensity', 'mean_top_intensity',
+            'mean_background_intensity', 'mean_top_background_intensity',
+            'mean_final_intensity'
+        ]
+        df = pd.DataFrame(columns=df_columns)
+    else:
+        df = pd.DataFrame()
+        df['frame'] = frame_number_list
+        df['total_intensity'] = total_intensity_list                 # Main img: sum of all pixels
+        df['n_values'] = n_values_list                               # Main img: count of pixels >= threshold
+        df['top_total_intensity'] = top_total_intensity_list         # Main img: sum of top_n pixels
+        df['background_total_intensity'] = background_total_intensity_list # Bg img: sum of all pixels
+        df['top_background_intensity'] = top_background_intensity_list   # Bg img: sum of pixels at main img's top_n locations
+
+        # Calculate mean intensity for pixels above threshold in main image
+        with warnings.catch_warnings(): # Suppress RuntimeWarning for division by zero if n_values is 0
+             warnings.simplefilter("ignore", category=RuntimeWarning)
+             df['mean_intensity'] = np.divide(
+                 df['total_intensity'], df['n_values'],
+                 out=np.full_like(df['total_intensity'], np.nan, dtype=float), # Output NaN if n_values is 0
+                 where=df['n_values'] != 0
+            )
+
+        # Mean of top_n brightest pixels from main image
+        df['mean_top_intensity'] = df['top_total_intensity'] / top_n
+
+        # Mean background intensity (original calculation: total background sum / top_n)
+        # This uses the sum of *all* background pixels, scaled by top_n.
+        df['mean_background_intensity'] = df['background_total_intensity'] / top_n
+
+        # Mean background intensity from pixels at main image's top_n locations
+        df['mean_top_background_intensity'] = df['top_background_intensity'] / top_n
+
+        # Final mean intensity: (mean of top_n main img pixels) - (mean of bg img pixels at top_n locations)
+        df['mean_final_intensity'] = df['mean_top_intensity'] - df['mean_top_background_intensity']
+
+    # --- Save DataFrame to CSV ---
+    try:
+        print(f"Saving measurements to {output_csv_path}...")
+        df.to_csv(output_csv_path, index=False, na_rep='NaN') # Save without DataFrame index, represent NaN as 'NaN'
+        print('--- Image Measurement Script Finished Successfully ---')
+    except Exception as e:
+        print(f"ERROR: Failed to save output CSV to {output_csv_path}: {e}")
+        sys.exit(1)
+
+def apply_mask(raw_img_path, mask_img_path, background_img_path,
+               masked_raw_out_path, masked_bg_out_path):
+    """
+    Applies a binary mask stack frame-by-frame to both a raw image stack
+    and a background image (which can be a stack or a single 2D frame).
+
+    Args:
+        raw_img_path (str): Path to the raw input TIFF stack.
+        mask_img_path (str): Path to the binary mask TIFF stack.
+        background_img_path (str): Path to the background TIFF (stack or 2D).
+        masked_raw_out_path (str): Output path for the masked raw image stack.
+        masked_bg_out_path (str): Output path for the masked background image stack.
+
+    Returns:
+        None: Writes results directly to the output files.
+    """
+    print("--- Starting Image Masking Script ---")
+    print(f"Raw Input: {raw_img_path}")
+    print(f"Mask Input: {mask_img_path}")
+    print(f"Background Input: {background_img_path}")
+    print(f"Masked Raw Output: {masked_raw_out_path}")
+    print(f"Masked Background Output: {masked_bg_out_path}")
+
+    # --- Load Background Image ---
+    # Load background first to determine if it's 2D or 3D
+    try:
+        background_data = tiff.imread(background_img_path)
+        is_background_stack = len(background_data.shape) >= 3
+        print(f"Background loaded. Shape: {background_data.shape}, Is Stack: {is_background_stack}")
+    except FileNotFoundError:
+        print(f"ERROR: Background image file not found: {background_img_path}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: Failed to load background image {background_img_path}: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+
+    # --- Open Input Files and Output Writers ---
+    try:
+        # Use TiffFile for potentially large raw/mask stacks to read page-by-page
+        with tiff.TiffFile(mask_img_path) as tif_mask, \
+             tiff.TiffFile(raw_img_path) as tif_raw, \
+             tiff.TiffWriter(masked_raw_out_path, bigtiff=True) as writer_raw_masked, \
+             tiff.TiffWriter(masked_bg_out_path, bigtiff=True) as writer_bg_masked:
+
+            num_mask_frames = len(tif_mask.pages)
+            num_raw_frames = len(tif_raw.pages)
+            print(f"Mask frames: {num_mask_frames}, Raw frames: {num_raw_frames}")
+
+            # --- Frame Count Sanity Checks ---
+            if num_mask_frames != num_raw_frames:
+                warnings.warn(f"Warning: Mask ({num_mask_frames}) and Raw ({num_raw_frames}) frame counts differ! Processing minimum.")
+                process_frames = min(num_mask_frames, num_raw_frames)
+            else:
+                process_frames = num_mask_frames
+
+            if is_background_stack and len(background_data) != process_frames:
+                 warnings.warn(f"Warning: Background stack length ({len(background_data)}) differs from mask/raw ({process_frames})! Processing minimum.")
+                 process_frames = min(process_frames, len(background_data))
+
+            if process_frames == 0:
+                 print("Warning: No frames to process based on input lengths.")
+                 return # Exit if nothing to do
+
+            print(f"Processing {process_frames} frames...")
+
+            # --- Process Frame by Frame ---
+            for i in range(process_frames):
+                mask = tif_mask.pages[i].asarray()
+                raw_img = tif_raw.pages[i].asarray()
+
+                # Determine the correct background frame
+                if is_background_stack:
+                    bg_img = background_data[i]
+                else: # Background is 2D
+                    bg_img = background_data # Use the same 2D image
+
+                # Apply mask: where mask is True (non-zero), keep image value, else 0
+                # Ensure mask is boolean for np.where if it isn't already
+                mask_bool = mask > 0
+
+                img_masked = np.where(mask_bool, raw_img, 0).astype(raw_img.dtype) # Preserve raw dtype
+                bg_masked = np.where(mask_bool, bg_img, 0).astype(background_data.dtype) # Preserve bg dtype
+
+                # Write the masked frames to their respective output files
+                writer_raw_masked.write(img_masked, contiguous=True, photometric='minisblack')
+                writer_bg_masked.write(bg_masked, contiguous=True, photometric='minisblack')
+
+                #if (i + 1) % 100 == 0: # Optional progress update
+                #    print(f"Processed frame {i+1}/{process_frames}")
+
+            print(f"Finished processing {process_frames} frames.")
+
+    except FileNotFoundError as e:
+        print(f"ERROR: Input file not found: {e.filename}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: An error occurred during processing or writing:")
+        traceback.print_exc()
+        # Attempt to clean up potentially incomplete output files? Optional.
+        # try: os.remove(masked_raw_out_path) except OSError: pass
+        # try: os.remove(masked_bg_out_path) except OSError: pass
+        sys.exit(1)
+
+    print("--- Image Masking Script Finished Successfully ---")
+    
+
+def apply_gaussian_subtract(input_path, output_path, sigma):
+    """
+    Applies a Gaussian blur to each frame of an input TIFF stack,
+    subtracts the blurred version from the original, clips the result
+    to the uint16 range [0, 65535], and saves the output stack.
+
+    Args:
+        input_path (str): Path to the input uint16 TIFF stack.
+        output_path (str): Path to save the processed uint16 TIFF stack.
+        sigma (float): Standard deviation for Gaussian kernel.
+    """
+    print("--- Starting Gaussian Blur Subtraction Script ---")
+    print(f"Input Image: {input_path}")
+    print(f"Output Image: {output_path}")
+    print(f"Gaussian Sigma: {sigma}")
+
+    output_dtype = np.uint16
+    max_val_uint16 = np.iinfo(output_dtype).max # Get max value for uint16 (65535)
+
+    try:
+        # Open input for reading page-by-page and output for writing
+        with tiff.TiffFile(input_path) as tif, \
+             tiff.TiffWriter(output_path, bigtiff=True) as out_tif:
+
+            n_frames = len(tif.pages)
+            print(f"Processing {n_frames} frames...")
+
+            for i, page in enumerate(tif.pages):
+                img = page.asarray()
+
+                # Ensure input is treated as uint16 if it isn't already
+                if img.dtype != np.uint16:
+                    warnings.warn(f"Frame {i}: Input dtype is {img.dtype}, expected uint16. Casting.")
+                    img = img.astype(np.uint16)
+
+                # Apply Gaussian blur
+                # gaussian_filter handles different dtypes appropriately
+                blurred = gaussian_filter(img, sigma=sigma)
+
+                # Subtract and clip
+                # Convert to float32 for subtraction to prevent uint underflow/overflow issues
+                # Using float64 might be safer for precision but uses more memory
+                subtracted_float = img.astype(np.float32) - blurred.astype(np.float32)
+
+                # Clip values below 0
+                subtracted_float[subtracted_float < 0] = 0
+                # Clip values above the max for the target uint16 type
+                subtracted_float[subtracted_float > max_val_uint16] = max_val_uint16
+
+                # Convert back to the target output dtype (uint16)
+                subtracted_final = subtracted_float.astype(output_dtype)
+
+                # Write the processed frame with metadata hints
+                out_tif.write(
+                    subtracted_final,
+                    contiguous=True,        # Hint for memory layout
+                    photometric='minisblack' # Metadata for grayscale interpretation
+                )
+
+                if (i + 1) % 100 == 0: # Optional progress update
+                    print(f"Processed frame {i+1}/{n_frames}")
+
+            print(f"Finished processing {n_frames} frames.")
+
+    except FileNotFoundError:
+        print(f"ERROR: Input file not found: {input_path}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: An error occurred during processing or writing:")
+        traceback.print_exc()
+        # Consider removing incomplete output file on error
+        # try: os.remove(output_path) except OSError: pass
+        sys.exit(1)
+
+    print(f"--- Done saving processed stack to {output_path} ---")
+ 
+
+    # function: subtract_background
+    # input --> data 2d np.array, background as 2d np.array (any type!)
+    # features: warn for saturation?
+    # options: invert output, normalization
+
+    # function: subtract_background_from_stack
+    # input --> data as dask array pointer, background as 2d np.array
+    # features: save to output_filepath, warn for saturation?
+    # options: invert output, normalization
+
+    # function: read_and_subtract_background_from_stack
+    # input --> data_filepath, background_filepath, output_filepath
+    # features: warn for saturation?
+    # options: invert output, normalization
+
+def stack_subtract_background_8bit(input_filepath, output_filepath, background_img_filepath,
+                              invert=False, handle_saturation=False): 
+    """
+    Reads data as bigtiff wihtout noticing any metadata information.
+    Data has to be 3 dim 2d(x,y) + time.
+    Background as single 2d image
+    Subtracts a background image from each frame of an input stack (uint8),
+    optionally inverting the output. 
+
+    This method doesn't work well: Adds the mean of the original background
+    as an offset before clipping and saving as uint8. Optionally handles
+    pixels saturated in both input and background by setting them to 0. Alternative: normalization
+
+    Parameters:
+    ----------
+    input_filepath : str
+        Input path to the uint8 tiff file/stack.
+    output_filepath : str
+        Path where the processed uint8 tiff file will be written.
+    background_img_filepath : str
+        Path to the uint8 background image (expected to be 2D).
+    invert : bool, optional
+        If False (default), calculates image - background.
+        If True, invert both input and background images (255-value)
+        before subtraction, effectively calculating background - image.
+    handle_saturation : bool, optional
+        If True, pixels saturated (255) in both the input frame and the
+        original background will be set to 0 in the output frame.
+        Defaults to False.
+
+    Returns:
+    ----------
+    None
+    """
+    print("--- Starting Background Subtraction ---")
+    print(f"Input: {input_filepath}")
+    print(f"Background: {background_img_filepath}")
+    print(f"Output: {output_filepath}")
+    print(f"Invert: {invert}")
+    print(f"Handle Saturation: {handle_saturation}") # Print new flag status
+
+    # If you want to use this function only for uint8
+    # 
+
+    output_dtype = np.uint8
+    max_val_uint8 = 255 # Max value for uint8
+    saturation_value = 255 # Value considered saturated for uint8
+
+    # --- Load Background Image ---
+    try:
+        # Ensure MicroscopeDataReader is imported correctly above
+        reader_obj_background = MicroscopeDataReader(background_img_filepath, as_raw_tiff=True, raw_tiff_is_2d=True)
+        # Compute immediately as it's needed repeatedly and expected to be small
+        #bg_img_original = reader_obj_background. # directly get the image as numpy array
+        bg_img_original = np.array(da.squeeze(reader_obj_background.dask_array))
+
+        # Validate background type
+        if bg_img_original.dtype != output_dtype:
+            raise TypeError(f"Background image dtype is {bg_img_original.dtype}, expected {output_dtype}")
+        if len(bg_img_original.shape) != 2:
+             raise ValueError(f"Background image has shape {bg_img_original.shape}, expected 2D.")
+
+        print(f"Background image loaded with shape: {bg_img_original.shape}")
+
+    except FileNotFoundError:
+        print(f"ERROR: Background image file not found: {background_img_filepath}")
+        # better: reraise the exception for exception handling
+        sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: Failed to load or validate background image: {e}")
+        traceback.print_exc() # nice one, doesen't it need the e as argument?
+        # reraise error for better error handling!
+        sys.exit(1)
+
+    # --- Calculate Offset (Mean of Original Background) ---
+    # Calculate before potential inversion
+    background_offset = np.mean(bg_img_original)
+    # better offset: max-min (2x?)
+    print(f"Calculated background offset (mean): {background_offset:.2f}")
+
+    # --- Prepare Background (Invert if specified) ---
+    bg_img_processed = bg_img_original.copy() # Work on a copy
+    # perhaps this can be done at the end?
+    if invert:
+        print("Inverting background image for subtraction...")
+        bg_img_processed = cv2.bitwise_not(bg_img_processed)
+
+    # Convert background to float32 once for calculations
+    # good, should be at least one bigger than original data (uint8 -> float16)
+    bg_img_float = bg_img_processed.astype(np.float32)
+
+    # --- Load Input Image Stack Reader ---
+    try:
+        # Ensure MicroscopeDataReader is imported correctly above
+        # Attempting to load directly as raw tiff
+        reader_obj_video = MicroscopeDataReader(input_filepath, as_raw_tiff=True, raw_tiff_num_slices=1)
+
+        # Get the dask array representation
+        tif_stack = da.squeeze(reader_obj_video.dask_array)
+
+        # Check input stack dtype *before* loop if possible from dask array metadata
+        if tif_stack.dtype != output_dtype:
+             raise TypeError(f"Input stack dtype is {tif_stack.dtype}, expected {output_dtype}")
+
+        print(f"Input stack loaded (as Dask array). Shape: {tif_stack.shape}, Dtype: {tif_stack.dtype}")
+
+    # Removed NameError exception block
+    except FileNotFoundError:
+        print(f"ERROR: Input file/folder not found: {input_filepath}")
+        # reraise error for better error handling!
+        sys.exit(1)
+    except Exception as e:
+        # This will now catch TypeError if the reader fails in that specific way,
+        # along with other potential loading errors.
+        # It will also catch NameError if MicroscopeDataReader is not imported/defined.
+        print(f"ERROR: Failed to load input stack: {e}")
+        traceback.print_exc()
+        # reraise error for better error handling!
+        sys.exit(1)
+
+    # --- Process Frame by Frame ---
+    try:
+        with tiff.TiffWriter(output_filepath, bigtiff=True) as tif_writer:
+            num_frames = tif_stack.shape[0] # Assuming first dimension is frames
+            print(f"Processing {num_frames} frames...")
+
+            for i, img_frame in enumerate(tif_stack): # use the dask array interface!
+                # Compute the frame from Dask array to NumPy array
+                img = np.array(img_frame) # This is the ORIGINAL frame data
+
+                # Validate frame shape and type (redundant if checked above, but safe)
+                if img.shape != bg_img_original.shape:
+                    raise ValueError(f"Frame {i} shape {img.shape} differs from background shape {bg_img_original.shape}")
+                if img.dtype != output_dtype:
+                     warnings.warn(f"Frame {i} dtype is {img.dtype}, expected {output_dtype}. Casting.")
+                     img = img.astype(output_dtype)
+
+                # --- Invert Frame if specified ---
+                img_processed = img.copy() # Use a copy for processing
+                if invert:
+                    img_processed = cv2.bitwise_not(img_processed)
+
+                # --- Subtract, Offset, Clip, Convert ---
+                # Convert current frame to float32
+                img_float = img_processed.astype(np.float32)
+
+                # Subtract background (float result, can be negative)
+                subtracted_float = img_float - bg_img_float
+
+                # Add the pre-calculated mean of the original background as offset
+                offset_subtracted_float = subtracted_float + background_offset
+
+                # CRITICAL: Clip the result to the valid uint8 range [0, 255]
+                # clipping shouldn't accur, raise error but after handle_saturation
+                # alternative: normalize if flag in the function is set
+                clipped_float = np.clip(offset_subtracted_float, 0, max_val_uint8)
+
+                # Convert back to the final uint8 type
+                final_img = clipped_float.astype(output_dtype)
+
+                # --- Handle Saturation (Optional) ---
+                if handle_saturation: # do always!
+                    # Find pixels saturated in BOTH original frame and original background
+                    # what is the goal of this?
+                    # should not happen!
+                    # putting 255 to zero does the opposit you want?!
+                    # throw warning!
+                    # this way not possible for inverted images
+                    saturated_mask = (img == saturation_value) & (bg_img_original == saturation_value)
+                    # Set these pixels to 0 in the final output frame
+                    final_img[saturated_mask] = 0
+
+                # --- Write Frame ---
+                tif_writer.write(
+                    final_img,
+                    photometric='minisblack', # Metadata hint
+                    contiguous=True         # Memory layout hint
+                )
+
+                if (i + 1) % 100 == 0: # Optional progress update
+                    # change to overwrite the line (end = . . . google)
+                    print(f"Processed frame {i+1}/{num_frames}")
+
+            print(f"Finished processing {num_frames} frames.")
+
+    except Exception as e:
+        print(f"\n--- ERROR during processing/writing loop ---")
+        print(f"{type(e).__name__}: {e}")
+        print("Traceback:")
+        traceback.print_exc()
+        print(f"Output file '{output_filepath}' may be incomplete or corrupted.")
+        # re throw exception for better exception handling!
+        sys.exit(1) # Exit on error during processing
+
+    print(f"--- Successfully saved processed stack to {output_filepath} ---")
 
 
 #if __name__ == "__main__":

@@ -16,7 +16,12 @@ FUNCTION_MAP = {'tiff2avi': imfunctions.tiff2avi,
                 'stack_make_binary': imfunctions.stack_make_binary,
                 'stack_normalise': imfunctions.stack_normalise,
                 'images2stack': imfunctions.images2stack,
-                'stack_extract_and_save_contours_with_children':imfunctions.stack_extract_and_save_contours_with_children
+                'stack_extract_and_save_contours_with_children':imfunctions.stack_extract_and_save_contours_with_children,
+                'stack_make_binary_tracked': imfunctions.stack_make_binary_tracked,
+                'calculate_measurements': imfunctions.calculate_measurements,
+                'apply_mask': imfunctions.apply_mask,
+                'apply_gaussian_subtract': imfunctions.apply_gaussian_subtract,
+                #'stack_subtract_background_BH': imfunctions.stack_subtract_background_BH
                 }
 
 
@@ -136,6 +141,45 @@ parser_o.add_argument('-ri', '--raw_input_filepath', help='raw input filepath', 
 parser_o.add_argument('-o', '--output_folder', help='output folder', required=True)
 parser_o.add_argument('-ct', '--crop', action='store_true', help='set crop to True', required=False)
 parser_o.add_argument('-s', '--subsample', help='subsample', type=int, required=False)
+
+#parser for stack_make_binary_tracked
+parser_p= subparsers.add_parser('stack_make_binary_tracked', help='stack_make_binary_tracked help')
+parser_p.add_argument("-i", "--stack_input_filepath", required=True, help="path to the input image")
+parser_p.add_argument("-o", "--stack_output_filepath", required=True, help="path to the output image")
+parser_p.add_argument("-th", "--threshold", required=True, type=float, help="threshold")
+parser_p.add_argument("-max_val", "--max_value", required=True, type=float, help="max value that will be assigned")
+parser_p.add_argument("-min_size", "--min_component_size", required=True, type=int, default=3, help="Min component pixel count")
+parser_p.add_argument("-roi_half", "--roi_half_size", required=True, type=int, default=10, help="Half-size of square tracking ROI")
+
+parser_q= subparsers.add_parser('calculate_measurements', help='calculate_measurements help')
+parser_q.add_argument("-i", "--input_img_path", required=True, help="Path to the main input TIFF stack (masked image).")
+parser_q.add_argument("-bg", "--background_img_path", required=True, help="Path to the background TIFF stack (or single image).")
+parser_q.add_argument("-o", "--output_csv_path", required=True, help="Path where the output CSV file will be saved.")
+parser_q.add_argument("-t", "--threshold", required=True, type=float, help="Intensity threshold for counting pixels.")
+parser_q.add_argument("-n", "--top_n", required=True, type=int, help="Number of top intensity pixels to consider.")
+
+parser_r= subparsers.add_parser('apply_mask', help='apply_mask help')
+parser_r.add_argument("-i", "--raw_img_path", required=True, help="Path to the raw input TIFF stack.")
+parser_r.add_argument("-m", "--mask_img_path", required=True, help="Path to the binary mask TIFF stack.")
+parser_r.add_argument("-bg", "--background_img_path", required=True, help="Path to the background TIFF (stack or 2D).")
+parser_r.add_argument("-or", "--masked_raw_out_path", required=True, help="Output path for the masked raw image stack.")
+parser_r.add_argument("-ob", "--masked_bg_out_path", required=True, help="Output path for the masked background image stack.")
+
+
+parser_s= subparsers.add_parser('apply_gaussian_subtract', help='apply_gaussian_subtract help')
+parser_s.add_argument("-i", "--input_path", required=True, help="Path to the input uint16 TIFF stack.")
+parser_s.add_argument("-o", "--output_path", required=True, help="Path to save the processed uint16 TIFF stack.")
+parser_s.add_argument("-s", "--sigma", required=True, type=float, help="Standard deviation (sigma) for the Gaussian kernel.")
+
+
+parser_t= subparsers.add_parser('stack_subtract_background_BH', help='stack_subtract_background_BH help')
+parser_t.add_argument("-i", "--input", required=True, help="Path to the input uint8 TIFF stack.")
+parser_t.add_argument("-bg", "--background", required=True, help="Path to the 2D uint8 background TIFF image.")
+parser_t.add_argument("-o", "--output", required=True, help="Path to save the processed uint8 TIFF stack.")
+# Modified 'invert' argument handling to use 0 or 1
+parser_t.add_argument("--invert", type=int, choices=[0, 1], default=0, help="Invert images before subtraction? 1 calculates bg - img, 0 (default) calculates img - bg.")
+# Argument for saturation handling (Boolean flag)
+parser_t.add_argument("--handle-saturation", action='store_true', default=False, help="If set, pixels saturated (255) in both input and background will be set to 0 in the output.")
 
 #create below the parser for another function
 

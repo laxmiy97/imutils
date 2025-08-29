@@ -36,9 +36,9 @@ def generate_absolute_coordinates_wrapper(project_path, image_center_coordinates
     :return:
     """
     stage_coordinates = pd.read_csv(glob.glob(os.path.join(project_path, '*TablePos*'))[0])
-    stage_coordinates = stage_coordinates[['x', 'y']].values
+    stage_coordinates = stage_coordinates[['X', 'Y']].values
 
-    dlc_df = pd.read_hdf(glob.glob(os.path.join(project_path, '*BH/*.h5'))[0])
+    dlc_df = pd.read_hdf(glob.glob(os.path.join(project_path, '*BH/output/*_filtered.h5'))[0])
     bodypart_coordinates = dlc_df[dlc_df.columns.levels[0][0]][bodypart_name][['x', 'y']][:].values
 
     absolute_coordinates_df = generate_absolute_coordinates(bodypart_coordinates, image_center_coordinates,
